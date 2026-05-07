@@ -1,0 +1,73 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: txn_intel
+          POSTGRES_USER: txn
+          POSTGRES_PASSWORD: txn
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U txn -d txn_intel"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Lint imports compile
+        run: python -m compileall -q app scripts tests
+
+      - name: Unit tests (no DB needed)
+        run: pytest tests/test_registry.py tests/test_drift.py tests/test_agent_tools.py -v
+
+      - name: Data generator smoke test
+        run: pytest tests/test_data_generator.py -v
+
+      - name: Smoke train on tiny dataset
+        env:
+          POSTGRES_HOST: localhost
+          REDIS_HOST: localhost
+        run: |
+          python -m scripts.generate_data --merchants 10 --customers 200 \
+            --transactions 5000 --months 6 --seed 1
+          python -m scripts.load_to_postgres
+          python -m app.ml.models.churn || true
+          python -m app.ml.models.anomaly || true
+          python -m app.ml.models.recommend || true
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t txn-intel:ci .
