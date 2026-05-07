@@ -326,7 +326,7 @@ def _rows_to_df(rows: list[tuple]) -> pd.DataFrame:
 def gen_tickets(customers: pd.DataFrame, transactions: pd.DataFrame,
                 end_date: date, rng: np.random.Generator, fake: Faker) -> pd.DataFrame:
     """Free-text support tickets, ~2.5% of transactions trigger a ticket."""
-    sample_n = max(1000, int(len(transactions) * 0.025))
+    sample_n = min(len(transactions), max(1000, int(len(transactions) * 0.025)))
     if len(transactions) == 0:
         return pd.DataFrame()
     sample = transactions.sample(n=sample_n, random_state=42)
