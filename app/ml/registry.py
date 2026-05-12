@@ -4,14 +4,30 @@ Layout on disk:
     {model_dir}/
         churn/
             v20260506_134500/
-                model.joblib
+                model.pt              # torch state_dict
+                bundle.joblib         # python-side pre-processors / config
                 meta.json
             CHAMPION  -> v20260506_134500
         anomaly/
-            ...
+            v.../
+                autoencoder.keras
+                head.keras
+                bundle.joblib
+                meta.json
+        recommend/
+            v.../
+                two_tower.pt
+                ranker.keras
+                bundle.joblib
+                meta.json
 
 CHAMPION is a text file pointing to the active version. Promotion is atomic
 (write to .tmp, then rename).
+
+Each model module is responsible for implementing its own ``save_artifacts``
+and ``load_artifacts`` helpers — the registry just provides versioning,
+metadata, champion tracking, and GC. This keeps the registry agnostic to
+which DL framework a given model uses.
 """
 from __future__ import annotations
 
@@ -21,7 +37,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import joblib
 
@@ -53,17 +69,27 @@ class ModelRegistry:
     def _model_dir(self, name: str) -> Path:
         return self.base_dir / name
 
-    def _version_dir(self, name: str, version: str) -> Path:
+    def version_dir(self, name: str, version: str) -> Path:
         return self._model_dir(name) / version
 
     @staticmethod
     def new_version() -> str:
         return "v" + datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-    def save(self, name: str, model: Any, metadata: ModelMetadata) -> str:
-        version_dir = self._version_dir(name, metadata.version)
+    def save(self, name: str, model: Any, metadata: ModelMetadata,
+             saver: Callable[[Any, Path], None] | None = None) -> str:
+        """Persist a model + metadata.
+
+        ``saver``: callable(model, version_dir) responsible for writing the
+        framework-specific artifacts (e.g. torch state_dict, keras model).
+        If omitted, falls back to joblib.dump for backward compatibility.
+        """
+        version_dir = self.version_dir(name, metadata.version)
         version_dir.mkdir(parents=True, exist_ok=True)
-        joblib.dump(model, version_dir / "model.joblib")
+        if saver is None:
+            joblib.dump(model, version_dir / "model.joblib")
+        else:
+            saver(model, version_dir)
         with open(version_dir / "meta.json", "w") as f:
             json.dump(asdict(metadata), f, indent=2)
         log.info("saved %s/%s with metrics=%s", name, metadata.version, metadata.metrics)
@@ -76,16 +102,26 @@ class ModelRegistry:
         return sorted(p.name for p in d.iterdir() if p.is_dir() and p.name.startswith("v"))
 
     def get_metadata(self, name: str, version: str) -> ModelMetadata:
-        with open(self._version_dir(name, version) / "meta.json") as f:
+        with open(self.version_dir(name, version) / "meta.json") as f:
             data = json.load(f)
         return ModelMetadata(**data)
 
-    def load(self, name: str, version: str | None = None) -> tuple[Any, ModelMetadata]:
+    def load(self, name: str, version: str | None = None,
+             loader: Callable[[Path], Any] | None = None) -> tuple[Any, ModelMetadata]:
         if version is None:
             version = self.champion(name)
         if version is None:
             raise FileNotFoundError(f"no model registered for {name}")
-        model = joblib.load(self._version_dir(name, version) / "model.joblib")
+        vdir = self.version_dir(name, version)
+        if loader is None:
+            model_path = vdir / "model.joblib"
+            if not model_path.exists():
+                raise FileNotFoundError(
+                    f"no model.joblib in {vdir}; pass a loader for non-joblib artifacts"
+                )
+            model = joblib.load(model_path)
+        else:
+            model = loader(vdir)
         meta = self.get_metadata(name, version)
         return model, meta
 
@@ -96,7 +132,7 @@ class ModelRegistry:
         return marker.read_text().strip()
 
     def promote(self, name: str, version: str) -> None:
-        if not self._version_dir(name, version).exists():
+        if not self.version_dir(name, version).exists():
             raise FileNotFoundError(f"{name}/{version} does not exist")
         marker = self._model_dir(name) / "CHAMPION"
         tmp = marker.with_suffix(".tmp")
@@ -116,14 +152,13 @@ class ModelRegistry:
     def gc(self, name: str, keep: int = 5) -> int:
         versions = self.list_versions(name)
         champion = self.champion(name)
-        # Keep the N most recent + always keep champion
         keep_set = set(versions[-keep:])
         if champion:
             keep_set.add(champion)
         removed = 0
         for v in versions:
             if v not in keep_set:
-                shutil.rmtree(self._version_dir(name, v))
+                shutil.rmtree(self.version_dir(name, v))
                 removed += 1
         if removed:
             log.info("gc %s: removed %d versions", name, removed)
