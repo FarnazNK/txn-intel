@@ -1,22 +1,29 @@
-"""Churn prediction.
+"""Churn prediction — PyTorch MLP.
 
 Label definition: a customer is "churned at as_of_date" if they had >=1 txn in
 the 90 days BEFORE as_of_date but ZERO txns in the 60 days AFTER as_of_date.
 This gives a forward-looking, behaviorally grounded label.
 
 Features: from feat_customer_daily (point-in-time as of label date).
-Models: LogisticRegression baseline + GradientBoostingClassifier champion.
+Model: a small MLP trained with class-weighted BCE, AdamW, early stopping on
+validation PR-AUC. We keep a sklearn StandardScaler in front for numerical
+stability — fit on the training split only.
+
+The artifact bundle persisted to the registry is:
+    - model.pt        : torch state_dict
+    - bundle.joblib   : dict with {scaler, feature_order, model_config}
 """
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
 
+import joblib
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
+import torch
+import torch.nn as nn
 from sklearn.metrics import (
     average_precision_score,
     brier_score_loss,
@@ -26,7 +33,6 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy import text
 
@@ -38,12 +44,42 @@ from app.ml.registry import ModelMetadata, ModelRegistry
 log = get_logger(__name__)
 MODEL_NAME = "churn"
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def build_labels(label_dates: list[date]) -> pd.DataFrame:
-    """Build churn labels by joining transaction activity around each label date.
 
-    For each (customer, label_date), label = 1 if active in [-90, 0) and inactive in [0, +60).
+# ── Torch model ──────────────────────────────────────────────────────────────
+class ChurnMLP(nn.Module):
+    """Small feed-forward classifier producing a single logit.
+
+    Architecture: [in_dim -> 64 -> 32 -> 1] with BatchNorm, ReLU, Dropout.
+    Kept deliberately compact: the feature set is ~10-30 numerical features
+    and the dataset is tens of thousands of rows, so depth/width past this
+    just overfits.
     """
+
+    def __init__(self, in_dim: int, hidden: tuple[int, int] = (64, 32),
+                 dropout: float = 0.2) -> None:
+        super().__init__()
+        h1, h2 = hidden
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, h1),
+            nn.BatchNorm1d(h1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h1, h2),
+            nn.BatchNorm1d(h2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(h2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # noqa: D401
+        return self.net(x).squeeze(-1)
+
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+def build_labels(label_dates: list[date]) -> pd.DataFrame:
+    """Build churn labels by joining transaction activity around each label date."""
     sql = text("""
         WITH params AS (SELECT :label_date::date AS d),
         active_before AS (
@@ -95,25 +131,83 @@ def fetch_features_for_labels(labels: pd.DataFrame) -> pd.DataFrame:
     return labels.merge(feats, on=["customer_id", "as_of_date"], how="inner")
 
 
-def build_pipelines() -> dict[str, Pipeline]:
-    pre = ColumnTransformer([("num", StandardScaler(), CUSTOMER_FEATURES)])
-    return {
-        "logreg": Pipeline([
-            ("pre", pre),
-            ("clf", LogisticRegression(max_iter=200, class_weight="balanced", C=1.0)),
-        ]),
-        "gbm": Pipeline([
-            ("pre", pre),
-            ("clf", GradientBoostingClassifier(
-                n_estimators=200, max_depth=3, learning_rate=0.05,
-                subsample=0.8, random_state=42,
-            )),
-        ]),
-    }
+# ── Training loop ────────────────────────────────────────────────────────────
+def _train_mlp(X_tr: np.ndarray, y_tr: np.ndarray,
+               X_val: np.ndarray, y_val: np.ndarray,
+               in_dim: int, *,
+               epochs: int = 60, batch_size: int = 512,
+               lr: float = 1e-3, weight_decay: float = 1e-4,
+               patience: int = 8) -> tuple[ChurnMLP, dict]:
+    """Train the MLP with early stopping on validation PR-AUC.
+
+    Returns the best model state and a small history dict.
+    """
+    model = ChurnMLP(in_dim=in_dim).to(DEVICE)
+
+    # Class-weighted BCE: pos_weight = neg/pos so the positive class is
+    # up-weighted in proportion to its rarity.
+    pos = float((y_tr == 1).sum())
+    neg = float((y_tr == 0).sum())
+    pos_weight = torch.tensor(max(neg, 1.0) / max(pos, 1.0), device=DEVICE)
+    loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optim = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    X_tr_t = torch.from_numpy(X_tr.astype(np.float32))
+    y_tr_t = torch.from_numpy(y_tr.astype(np.float32))
+    X_val_t = torch.from_numpy(X_val.astype(np.float32)).to(DEVICE)
+
+    ds = torch.utils.data.TensorDataset(X_tr_t, y_tr_t)
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+
+    best_pr_auc = -1.0
+    best_state: dict[str, torch.Tensor] | None = None
+    epochs_no_improve = 0
+    history: list[dict] = []
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        running = 0.0
+        for xb, yb in loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optim.zero_grad()
+            logits = model(xb)
+            loss = loss_fn(logits, yb)
+            loss.backward()
+            optim.step()
+            running += float(loss.item()) * xb.size(0)
+        train_loss = running / len(ds)
+
+        model.eval()
+        with torch.no_grad():
+            val_logits = model(X_val_t).cpu().numpy()
+        val_proba = 1.0 / (1.0 + np.exp(-val_logits))
+        val_pr_auc = float(average_precision_score(y_val, val_proba))
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_pr_auc": val_pr_auc})
+
+        if val_pr_auc > best_pr_auc + 1e-5:
+            best_pr_auc = val_pr_auc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                log.info("early stopping at epoch %d (best val_pr_auc=%.4f)",
+                         epoch, best_pr_auc)
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    return model, {"best_val_pr_auc": best_pr_auc, "history": history}
+
+
+def _predict_proba(model: ChurnMLP, X: np.ndarray) -> np.ndarray:
+    model.eval()
+    with torch.no_grad():
+        logits = model(torch.from_numpy(X.astype(np.float32)).to(DEVICE)).cpu().numpy()
+    return 1.0 / (1.0 + np.exp(-logits))
 
 
 def evaluate(y_true: np.ndarray, y_proba: np.ndarray) -> dict[str, float]:
-    # Pick threshold that maximizes F1 on PR curve
     p, r, t = precision_recall_curve(y_true, y_proba)
     f1s = 2 * p * r / np.clip(p + r, 1e-9, None)
     best_idx = int(np.nanargmax(f1s[:-1])) if len(f1s) > 1 else 0
@@ -130,16 +224,53 @@ def evaluate(y_true: np.ndarray, y_proba: np.ndarray) -> dict[str, float]:
     }
 
 
+# ── Persistence ──────────────────────────────────────────────────────────────
+def _save_artifacts(bundle: dict, version_dir: Path) -> None:
+    """Registry-compatible saver."""
+    torch.save(bundle["model"].state_dict(), version_dir / "model.pt")
+    side = {
+        "scaler": bundle["scaler"],
+        "feature_order": bundle["feature_order"],
+        "model_config": bundle["model_config"],
+    }
+    joblib.dump(side, version_dir / "bundle.joblib")
+
+
+def _load_artifacts(version_dir: Path) -> dict:
+    """Registry-compatible loader."""
+    side = joblib.load(version_dir / "bundle.joblib")
+    cfg = side["model_config"]
+    model = ChurnMLP(in_dim=cfg["in_dim"], hidden=tuple(cfg["hidden"]),
+                     dropout=cfg["dropout"]).to(DEVICE)
+    state = torch.load(version_dir / "model.pt", map_location=DEVICE)
+    model.load_state_dict(state)
+    model.eval()
+    return {
+        "model": model,
+        "scaler": side["scaler"],
+        "feature_order": side["feature_order"],
+        "model_config": cfg,
+    }
+
+
+def load_champion(registry: ModelRegistry | None = None) -> tuple[dict, ModelMetadata]:
+    """Convenience used by the inference service."""
+    registry = registry or ModelRegistry()
+    return registry.load(MODEL_NAME, loader=_load_artifacts)
+
+
+def predict_proba(bundle: dict, features_df: pd.DataFrame) -> np.ndarray:
+    """Score a small DataFrame whose columns are the feature schema."""
+    X = features_df[bundle["feature_order"]].astype(float).values
+    X = bundle["scaler"].transform(X)
+    return _predict_proba(bundle["model"], X)
+
+
+# ── Entrypoint ───────────────────────────────────────────────────────────────
 def train(label_dates: list[date] | None = None,
           backfill_features: bool = True) -> str:
-    """Train churn models and register the better one as champion.
-
-    label_dates: list of as-of dates to label on. We need a 60-day forward window
-                 after each, so don't include dates within 60 days of "now".
-    """
     if label_dates is None:
         today = date.today()
-        # Use 4 monthly snapshots ending 75 days ago
         label_dates = [today - timedelta(days=75 + 30 * i) for i in range(4)]
 
     if backfill_features:
@@ -156,28 +287,36 @@ def train(label_dates: list[date] | None = None,
     if df.empty:
         raise RuntimeError("no joined feature/label rows")
 
-    X = df[CUSTOMER_FEATURES].values
+    X = df[CUSTOMER_FEATURES].astype(float).values
     y = df["churned"].values.astype(int)
-    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
 
-    # Wrap as DataFrame for ColumnTransformer
-    X_tr_df = pd.DataFrame(X_tr, columns=CUSTOMER_FEATURES)
-    X_te_df = pd.DataFrame(X_te, columns=CUSTOMER_FEATURES)
+    # 60/20/20 train/val/test
+    X_tr_full, X_te, y_tr_full, y_te = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42,
+    )
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_tr_full, y_tr_full, test_size=0.25, stratify=y_tr_full, random_state=42,
+    )
 
-    pipelines = build_pipelines()
-    results: dict[str, tuple[Pipeline, dict[str, float]]] = {}
-    for name, pipe in pipelines.items():
-        log.info("fitting %s...", name)
-        pipe.fit(X_tr_df, y_tr)
-        proba = pipe.predict_proba(X_te_df)[:, 1]
-        metrics = evaluate(y_te, proba)
-        log.info("  %s metrics: %s", name, {k: round(v, 4) for k, v in metrics.items()})
-        results[name] = (pipe, metrics)
+    scaler = StandardScaler().fit(X_tr)
+    X_tr_s = scaler.transform(X_tr)
+    X_val_s = scaler.transform(X_val)
+    X_te_s = scaler.transform(X_te)
 
-    # Pick winner by PR-AUC
-    winner_name = max(results, key=lambda k: results[k][1]["pr_auc"])
-    winner_model, winner_metrics = results[winner_name]
-    log.info("winner: %s (pr_auc=%.4f)", winner_name, winner_metrics["pr_auc"])
+    in_dim = X_tr_s.shape[1]
+    log.info("training MLP (in_dim=%d, n_train=%d, n_val=%d)", in_dim, len(X_tr_s), len(X_val_s))
+    model, train_info = _train_mlp(X_tr_s, y_tr, X_val_s, y_val, in_dim=in_dim)
+
+    test_proba = _predict_proba(model, X_te_s)
+    metrics = evaluate(y_te, test_proba)
+    log.info("test metrics: %s", {k: round(v, 4) for k, v in metrics.items()})
+
+    bundle = {
+        "model": model,
+        "scaler": scaler,
+        "feature_order": CUSTOMER_FEATURES,
+        "model_config": {"in_dim": in_dim, "hidden": [64, 32], "dropout": 0.2},
+    }
 
     registry = ModelRegistry()
     version = ModelRegistry.new_version()
@@ -186,18 +325,17 @@ def train(label_dates: list[date] | None = None,
         version=version,
         trained_at=pd.Timestamp.utcnow().isoformat(),
         feature_schema=CUSTOMER_FEATURES,
-        metrics=winner_metrics,
+        metrics=metrics,
         training_window={
             "label_dates": ",".join(d.isoformat() for d in label_dates),
         },
-        n_train=int(len(X_tr)),
-        n_eval=int(len(X_te)),
-        notes=f"winner={winner_name}",
-        extra={"all_results": {k: v[1] for k, v in results.items()}},
+        n_train=int(len(X_tr_s)),
+        n_eval=int(len(X_te_s)),
+        notes=f"pytorch mlp; best_val_pr_auc={train_info['best_val_pr_auc']:.4f}",
+        extra={"framework": "pytorch", "device": str(DEVICE)},
     )
-    registry.save(MODEL_NAME, winner_model, meta)
+    registry.save(MODEL_NAME, bundle, meta, saver=_save_artifacts)
 
-    # Champion/challenger logic: promote if no champion or if better
     current = registry.champion(MODEL_NAME)
     if current is None:
         registry.promote(MODEL_NAME, version)
